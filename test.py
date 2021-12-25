@@ -60,12 +60,16 @@ def test_fsm():
     meta = StreamMeta(pcm_data_format='PCM_FORMAT_S16_LE')
     with CaptureDevice('sysdefault:CARD=system', stream_meta=meta) as cdev:
         main_fsm = FSM(cdev)
-        loop.create_task(main_fsm.start())
-        loop.run_forever()
+
+        try:
+            loop.create_task(main_fsm.start())
+            loop.run_forever()
+        except KeyboardInterrupt:
+            main_fsm.kill()
 
 
 if __name__ == '__main__':
-    test_readcapture()
+    #test_readcapture()
     #cProfile.run('test_unpackframe()')
     #cProfile.run('test_fsm()')
-    #test_fsm()
+    test_fsm()

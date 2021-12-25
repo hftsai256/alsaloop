@@ -4,14 +4,14 @@ import io
 import os
 import re
 import sys
+import math
 import struct
 import logging
 import asyncio
 import warnings
 import alsaaudio
-import itertools
-from struct import unpack_from
 from typing import Union, Iterable, Callable
+from itertools import islice
 from collections import namedtuple
 from dataclasses import dataclass
 
@@ -51,6 +51,15 @@ class StreamMeta:
         self.maxamp = 1 << int(bits) - 1
         self.reference = 0 if self.signed else self.maxamp
 
+
+@dataclass
+class ProbeConfig:
+    idle_interval: float = .25
+    streaming_interval: float = 1.0
+    start_count: int = 2
+    stop_count: int = 10
+
+
 @dataclass
 class AlsaDevice:
     name: str
@@ -60,7 +69,6 @@ class AlsaDevice:
     index: Union[int, None] = None
     occupied: bool = False
     device: alsaaudio.PCM = None
-    wait_time: float = 0.001
 
     def __init__(self,
                  pcm_name: str,
@@ -93,16 +101,12 @@ class CaptureDevice(AlsaDevice):
     def read(self):
         while True:
             length, data = self.device.read()
-
             if length > 0:
                 return data
-
             elif length == 0:
                 warnings.warn(f'Incomplete read {length=}', RuntimeWarning)
-
             elif length == -32:
                 warnings.warn(f'Broken Pipe: {length}', RuntimeWarning)
-
             else:
                 warnings.warn(f'Unknown Error: Code={length}', RuntimeWarning)
 
@@ -174,14 +178,6 @@ class MemScope:
                 f'{self.struct_t[(self.meta.signed, self.meta.size)] * self.meta.channels}')
 
 
-@dataclass
-class ProbeConfig:
-    idle_interval: float = .25
-    streaming_interval: float = 1.0
-    start_count: int = 3
-    stop_count: int = 5
-
-
 class FSM:
     Thresholds = namedtuple('Thresholds', ['start', 'stop'])
 
@@ -189,9 +185,10 @@ class FSM:
                  capture_dev: CaptureDevice,
                  probing: ProbeConfig = ProbeConfig(),
                  playback_pcm_name: str = 'default',
-                 threshold_db: float = -10):
+                 threshold_db: float = -60):
         self.loop = None
         self.counter = 0
+        self.killsig = False
         self.is_streaming = False
         self.probing = probing
         self.meta = capture_dev.meta
@@ -211,54 +208,71 @@ class FSM:
         self.loop.call_later(self.probing.idle_interval, asyncio.create_task, self.probe_idle())
 
     async def probe_idle(self):
-        self.buffer = await self.capture.read()
-        logging.debug(f'read {len(self.buffer)} bytes from device {self.capture.name}')
+        if self.killsig:
+            return
 
-        for packet in MemScope(self.buffer, self.meta):
-            if any(abs(p) > self.thresholds.start for p in packet):
-                self.counter += 1
-                logging.debug(f'probe_idle: {packet} > {self.thresholds.start:.0f}, {self.counter=}')
-                break
+        self.buffer = self.capture.read()
+        rms = self.rms(self.buffer)
+        if rms > self.thresholds.start:
+            self.counter += 1
+            logging.debug(f'probe_idle: {rms:.0f} > {self.thresholds.start:.0f}, {self.counter=}')
         else:
             self.counter = 0
-            logging.debug(f'probe_idle: no audio detected, {self.counter=}')
+            logging.debug(f'probe_idle: {rms:.0f} < {self.thresholds.start:.0f}, {self.counter=}')
 
         if self.counter > self.probing.start_count:
             self.counter = 0
             self.is_streaming = True
             self.loop.create_task(self.stream())
             self.loop.call_later(self.probing.streaming_interval, asyncio.create_task, self.probe_stream())
-
         else:
             self.loop.call_later(self.probing.idle_interval, asyncio.create_task, self.probe_idle())
 
     async def probe_stream(self):
-        for packet in MemScope(self.buffer, self.meta):
-            if all(abs(p) < self.thresholds.stop for p in packet):
-                self.counter += 1
-                logging.debug(f'probe_stream: {packet} < {self.thresholds.stop:.0f}, {self.counter=}')
-                break
+        if self.killsig:
+            return
+
+        rms = self.rms(self.buffer)
+        if rms < self.thresholds.stop:
+            self.counter += 1
+            logging.debug(f'probe_stream: {rms:.0f} < {self.thresholds.stop:.0f}, {self.counter=}')
         else:
             self.counter = 0
+            logging.debug(f'probe_stream: {rms:.0f} > {self.thresholds.stop:.0f}, {self.counter=}')
 
         if self.counter > self.probing.stop_count:
             self.is_streaming = False
             self.counter = 0
             self.loop.call_later(self.probing.idle_interval, asyncio.create_task, self.probe_idle())
-
         else:
             self.loop.call_later(self.probing.streaming_interval, asyncio.create_task, self.probe_stream())
 
     async def stream(self):
-        logging.info(f'start looping from device {self.capture.name}')
+        logging.info(f'start looping [{self.capture.name}] => [{self.playback_pcm_name}]')
 
         with PlaybackDevice(self.playback_pcm_name, self.meta) as playback:
-            await playback.write(self.buffer)
+            playback.write(self.buffer)
 
-            while self.is_streaming:
-                self.buffer = await self.capture.read()
-                await asyncio.sleep(self.meta.period_time * 0.75)
-                #await playback.write(self.buffer)
+            while self.is_streaming and not self.killsig:
+                self.buffer = self.capture.read()
+                playback.write(self.buffer)
+                await asyncio.sleep(0.001)
 
         logging.info('close playback')
 
+    def stop_playback(self):
+        self.is_streaming = False
+
+    def kill(self):
+        self.killsig = True
+        pending = asyncio.all_tasks()
+        self.loop.run_until_complete(asyncio.gather(*pending))
+
+    def rms(self, buffer, n_sample=5):
+        sumsq = 0
+        samples = islice(MemScope(buffer, self.meta), n_sample)
+        for packet in samples:
+            for val in packet:
+                sumsq += val**2
+
+        return math.sqrt(sumsq/n_sample/self.meta.channels)
