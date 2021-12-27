@@ -27,30 +27,11 @@ import sys
 import logging
 import time
 import threading
-import os
 import subprocess
 import signal
 import json
 
 import dbus.service
-from dbus.mainloop.glib import DBusGMainLoop
-import alsaloop
-
-alsaloopWrapper = None
-
-
-try:
-    from gi.repository import GLib
-    using_gi_glib = True
-except ImportError:
-    import glib as GLib
-
-identity = "alsaloop client"
-
-PLAYBACK_STOPPED = "stopped"
-PLAYBACK_PAUSED = "pause"
-PLAYBACK_PLAYING = "playing"
-PLAYBACK_UNKNOWN = "unkown"
 
 # python dbus bindings don't include annotations and properties
 MPRIS2_INTROSPECTION = """<node name="/org/mpris/MediaPlayer2">
@@ -195,13 +176,9 @@ class ALSALoopWrapper(threading.Thread):
             logging.error("Alsaloopwrapper thread exception: %s", e)
             sys.exit(1)
 
-        logging.error("AlsaloopWrapper thread died - this should not happen")
-        sys.exit(1)
 
     def mainloop_external(self):
-        current_playback_status = None
         while True:
-            
             if self.alsaloopclient is None:
                 cmdline = "python /opt/alsaloop/alsaloop.py {}".format(self.alsaloopdb)
                 logging.info("starting %s",cmdline)
@@ -247,8 +224,6 @@ class ALSALoopWrapper(threading.Thread):
             self.dbus_service.update_property('org.mpris.MediaPlayer2.Player',
                                                   'PlaybackStatus')
 
-
-            
     def reconfigure(self):
         if self.alsaloopclient is not None:
             self.alsaloopclient.kill()
@@ -270,11 +245,21 @@ class MPRISInterface(dbus.service.Object):
     PATH = "/org/mpris/MediaPlayer2"
     INTROSPECT_INTERFACE = "org.freedesktop.DBus.Introspectable"
     PROP_INTERFACE = dbus.PROPERTIES_IFACE
+    ROOT_INTERFACE = "org.mpris.MediaPlayer2"
+    ROOT_PROPS = {
+        "CanQuit": (False, None),
+        "CanRaise": (False, None),
+        "DesktopEntry": ("alsaloopmpris", None),
+        "HasTrackList": (False, None),
+        "Identity": (identity, None),
+        "SupportedUriSchemes": (dbus.Array(signature="s"), None),
+        "SupportedMimeTypes": (dbus.Array(signature="s"), None)
+    }
 
     def __init__(self):
         dbus.service.Object.__init__(self, dbus.SystemBus(),
                                      MPRISInterface.PATH)
-        self.name = "org.mpris.MediaPlayer2.alsaloop"
+        self.name = "org.mpris.MediaPlayer2.usbloop"
         self.bus = dbus.SystemBus()
         self.uname = self.bus.get_unique_name()
         self.dbus_obj = self.bus.get_object("org.freedesktop.DBus",
@@ -306,16 +291,6 @@ class MPRISInterface(dbus.service.Object):
         if hasattr(self, "_bus_name"):
             del self.bus_name
 
-    ROOT_INTERFACE = "org.mpris.MediaPlayer2"
-    ROOT_PROPS = {
-        "CanQuit": (False, None),
-        "CanRaise": (False, None),
-        "DesktopEntry": ("alsaloopmpris", None),
-        "HasTrackList": (False, None),
-        "Identity": (identity, None),
-        "SupportedUriSchemes": (dbus.Array(signature="s"), None),
-        "SupportedMimeTypes": (dbus.Array(signature="s"), None)
-    }
 
     @dbus.service.method(INTROSPECT_INTERFACE)
     def Introspect(self):
@@ -328,7 +303,8 @@ class MPRISInterface(dbus.service.Object):
                 PLAYBACK_STOPPED: 'Stopped',
                 PLAYBACK_UNKNOWN: 'Unknown'}[status]
 
-    def get_metadata():
+    @property
+    def get_metadata(self):
         return dbus.Dictionary(alsaloop_wrapper.metadata, signature='sv')
 
     PLAYER_INTERFACE = "org.mpris.MediaPlayer2.Player"
@@ -360,8 +336,6 @@ class MPRISInterface(dbus.service.Object):
                          in_signature="ss", out_signature="v")
     def Get(self, interface, prop):
         getter, _setter = self.PROP_MAPPING[interface][prop]
-        if callable(getter):
-            return getter()
         return getter
 
     @dbus.service.method(PROP_INTERFACE,
@@ -460,8 +434,6 @@ if __name__ == '__main__':
 
     signal.signal(signal.SIGUSR1, stop_alsaloop)
     signal.signal(signal.SIGHUP, reconfigure_alsaloop)
-
-    server = "192.168.30.110"
 
     # Create wrapper to manages the alsaloop child process
     try:
