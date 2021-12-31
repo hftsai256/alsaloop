@@ -270,8 +270,10 @@ class LoopStateMachine:
         manifests = {
             PlayerCommand.STOP:  TaskInfo(PlayerState.HYBERNATE,
                                           self.probe_cfg.hybernate_interval,
+                                          self._wake),
+            PlayerCommand.PLAY:  TaskInfo(PlayerState.IDLE,
+                                          self.probe_cfg.idle_interval,
                                           self._idle),
-            PlayerCommand.PLAY:  TaskInfo(PlayerState.IDLE, 0, self._idle),
         }
 
         self.loop = asyncio.get_running_loop()
@@ -286,6 +288,10 @@ class LoopStateMachine:
             self.state = todo.state
             self.loop.call_later(todo.delay, asyncio.create_task, todo.coro())
             self.rxq.task_done()
+
+    async def _wake(self):
+        self.state = PlayerState.IDLE
+        self.loop.create_task(self._idle())
 
     async def _idle(self):
         while self.state == PlayerState.IDLE:

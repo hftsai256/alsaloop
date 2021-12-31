@@ -44,12 +44,6 @@ Env = SimpleNamespace(
     CFGFILE=Path('/etc/usbloop.json'))
 
 
-@dataclass
-class CommandPacket:
-    command: PlayerCommand
-    payload: Dict
-
-
 class UpdatableDataclass:
     def update(self, new):
         for key, value in new.items():
@@ -59,7 +53,7 @@ class UpdatableDataclass:
 
 @dataclass
 class ProbeConfig(UpdatableDataclass):
-    sensitivity_db: float = -70
+    sensitivity_db: float = -60
     idle_interval: float = 0.25
     follow_interval: float = 0.1
     stream_interval: float = 2.0
