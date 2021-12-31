@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import io
+import os
 import re
 import json
 import struct
@@ -265,7 +266,7 @@ class LoopStateMachine:
 
 
     async def run(self):
-        TaskInfo = namedtuple('TaskInfo', ['local_state', 'delay', 'coro'])
+        TaskInfo = namedtuple('TaskInfo', ['state', 'delay', 'coro'])
         manifests = {
             PlayerCommand.STOP:  TaskInfo(PlayerState.HYBERNATE,
                                           self.probe_cfg.hybernate_interval,
@@ -282,7 +283,7 @@ class LoopStateMachine:
             await self._gather()
 
             todo = manifests[cmd]
-            self.state = todo.local_state
+            self.state = todo.state
             self.loop.call_later(todo.delay, asyncio.create_task, todo.coro())
             self.rxq.task_done()
 
@@ -370,6 +371,7 @@ def main():
     logging.captureWarnings(True)
     logging.basicConfig(level=logging.INFO)
 
+    logging.info('usbloop start as PID %d', os.getpid())
     loop = asyncio.get_event_loop()
 
     shutdown_signals = (signal.SIGTERM, signal.SIGINT)

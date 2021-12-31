@@ -5,7 +5,8 @@ from types import SimpleNamespace
 from dataclasses import dataclass, field
 import dbus
 
-PACKAGE_NAME = Path(__file__).parent.parts[-1]
+PACKAGE_ROOT = Path(__file__).parent
+PACKAGE_NAME = PACKAGE_ROOT.parts[-1]
 
 class PlayerCommand(Enum):
     STOP   = auto()
@@ -29,7 +30,7 @@ DBusConfig = SimpleNamespace(
     player_iface     = 'org.mpris.MediaPlayer2.Player',
     mpris_iface      = 'org.mpris.MediaPlayer2',
     path             = '/org/mpris/MediaPlayer2',
-    introspect_xml   = Path('mpris2_introspection.xml')
+    introspect_xml   = PACKAGE_ROOT/Path('mpris2_introspection.xml')
 )
 
 MPRISStatus = {
