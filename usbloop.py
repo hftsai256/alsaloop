@@ -264,7 +264,6 @@ class LoopStateMachine:
         except AttributeError:
             logging.warning('Cannot connect to DBus.')
 
-
     async def run(self):
         TaskInfo = namedtuple('TaskInfo', ['state', 'delay', 'coro'])
         manifests = {
@@ -381,8 +380,7 @@ def main():
     loop = asyncio.get_event_loop()
 
     shutdown_signals = (signal.SIGTERM, signal.SIGINT)
-    stop_signals = (signal.SIGUSR1, )
-    restart_signals = (signal.SIGHUP, )
+    restart_signals = (signal.SIGHUP, signal.SIGUSR1)
 
     capture_cfg = AlsaDeviceConfig('sysdefault:CARD=system', pcm_data_format='PCM_FORMAT_S16_LE')
     playback_cfg = AlsaDeviceConfig('default', pcm_data_format='PCM_FORMAT_S16_LE')
@@ -393,11 +391,6 @@ def main():
             for s in shutdown_signals:
                 loop.add_signal_handler(
                     s, lambda s=s: 
-                        asyncio.create_task(usbloop._shutdown(s)))
-
-            for s in stop_signals:
-                loop.add_signal_handler(
-                    s, lambda s=s:
                         asyncio.create_task(usbloop._shutdown(s)))
 
             for s in restart_signals:
