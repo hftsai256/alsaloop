@@ -1,7 +1,12 @@
 #!/usr/bin/env python
-from alsaloop import *
+from alsapipe import *
+from pathlib import Path
+import os
+import sys
 import cProfile
+import functools
 import logging
+import timeit
 
 logging.captureWarnings(True)
 logging.basicConfig(level=logging.DEBUG)
@@ -24,7 +29,7 @@ class MockDevice:
                       b'\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xdb\xdc\xdd\xde\xdf'
                       b'\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef'
                       b'\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff')
-    stream_cfg = StreamConfig(pcm_data_format='PCM_FORMAT_S16_LE')
+    stream_cfg = AlsaDeviceConfig('default', pcm_data_format='PCM_FORMAT_S16_LE')
     name = 'MockDevice'
 
     def __enter__(self):
@@ -36,13 +41,13 @@ class MockDevice:
     async def read(self):
         return self.tdata
 
-def test_readcapture():
-    stream_cfg = StreamConfig(pcm_data_format='PCM_FORMAT_S16_LE')
-    print(f'{stream_cfg!r}')
-    with CaptureDevice('sysdefault:CARD=system', stream_cfg=stream_cfg) as cdev:
-        for _ in range(50):
-            recv = cdev.read()
-            print(f'read {len(recv)} bytes from device {cdev.name}')
+@dataclass
+class TestCls:
+    prop: str = 'nono'
+
+    @property
+    def decprop(self):
+        return f'>>{self.prop}<<'
 
 def test_unpackframe():
     dev = MockDevice()
@@ -51,10 +56,22 @@ def test_unpackframe():
     for p in sc:
         continue
 
-def test_fsm():
-    main()
+def test_redirector():
+    setup_stmt = """
+import functools
+from test import MockDevice
+from alsapipe import AlsaDeviceConfig, LoopStateMachine
+capture_cfg = AlsaDeviceConfig('sysdefault:CARD=system', pcm_data_format='PCM_FORMAT_S16_LE')
+playback_cfg = AlsaDeviceConfig('default', pcm_data_format='PCM_FORMAT_S16_LE')
+redirector = LoopStateMachine(None, None, capture_cfg, playback_cfg)
+pfunc = functools.partial(redirector._smp_median, MockDevice.tdata)
+    """
+    print(timeit.timeit('pfunc()', setup=setup_stmt, number=1000))
+    
 
 if __name__ == '__main__':
-    test_readcapture()
-    cProfile.run('test_unpackframe()')
-    cProfile.run('test_fsm()')
+    print(Path(__file__).parent.parts[-1])
+    print(TestCls().decprop)
+    #test_redirector()
+    #test_readcapture()
+    #cProfile.run('test_unpackframe()')

@@ -2,8 +2,7 @@
 
 import io
 import re
-import math
-import enum
+import json
 import struct
 import signal
 import logging
@@ -14,10 +13,10 @@ import statistics
 from typing import Optional
 from itertools import islice
 from collections import namedtuple
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 
-logging.captureWarnings(True)
-logging.basicConfig(level=logging.INFO)
+from mpris import MPRISConnector
+from config import *
 
 @dataclass
 class AlsaDeviceConfig:
@@ -63,16 +62,6 @@ class AlsaDeviceConfig:
         self.period_time = period_frames / rate
         self.maxamp = 1 << int(bits) - 1
         self.reference = 0 if self.signed else self.maxamp
-
-
-@dataclass
-class ProbeConfig:
-    idle_interval: float = 1.0
-    follow_interval: float = 0.5
-    stream_interval: float = 2.0
-    hybernate_interval: float = 60
-    start_count: int = 1
-    stop_count: int = 10
 
 
 @dataclass
@@ -193,44 +182,57 @@ class MemScope:
         return (f'{endian}{body}')
 
 
-class PlayerCommand(enum.Enum):
-    STOP = enum.auto()
-    PLAY = enum.auto()
-
-
-class PlayerState(enum.Enum):
-    IDLE      = enum.auto()
-    PLAY      = enum.auto()
-    HYBERNATE = enum.auto()
-    KILLED    = enum.auto()
-    UNKNOWN   = enum.auto()
-
-
 class LoopStateMachine:
     def __init__(self,
-                 queue: asyncio.Queue,
                  capture_cfg: AlsaDeviceConfig,
-                 playback_cfg: AlsaDeviceConfig,
-                 probe_cfg: ProbeConfig = ProbeConfig(),
-                 threshold_db: float = -60):
-        self.queue = queue
-        self.state = PlayerState.UNKNOWN
+                 playback_cfg: AlsaDeviceConfig):
+        self.rxq = asyncio.Queue()
+        self._local_state = PlayerState.UNKNOWN
         self.counter = 0
         self.is_streaming = False
         self.capture_cfg = capture_cfg
         self.playback_cfg = playback_cfg
-        self.capture = CaptureDevice(self.capture_cfg)
-        self.probe_cfg = probe_cfg
+        self.probe_cfg = self.__load_config()
+        self.capture = None
+        self.dbus = None
         self.buffer = b''
 
         Thresholds = namedtuple('Thresholds', ['start', 'stop'])
         self.thresholds = Thresholds(
-                self.__reverse_db(threshold_db),
-                self.__reverse_db(threshold_db - 3)
+                self.__reverse_db(self.probe_cfg.sensitivity_db),
+                self.__reverse_db(self.probe_cfg.sensitivity_db - 3)
         )
 
     def __reverse_db(self, db):
         return self.capture_cfg.maxamp * 10**(-abs(db)/20)
+
+    def __smp_median(self, buffer, n_sample=20):
+        """Calculated median from data across all channels.
+           Takes around 0.5 ms at 20 frames on setero data. Slow but acceptable.
+        """
+        samples = islice(MemScope(buffer, self.capture_cfg), n_sample)
+        data = [abs(val - self.capture_cfg.reference) for packet in samples for val in packet]
+        return statistics.median(data)
+
+    def __load_config(self):
+        default = ProbeConfig()
+        try:
+            with open(Env.CFGFILE, 'r') as fp:
+                json_db = json.load(fp)
+                default.update(json_db)
+                logging.info('Load config from %s', Env.CFGFILE)
+        except (FileNotFoundError, json.decoder.JSONDecodeError):
+            logging.info('Cannot read %s. Using default configuration', Env.CFGFILE)
+            #TODO: Is there a better place to save config?
+            self.__save_config(cfg=asdict(default))
+        return default
+
+    def __save_config(self, cfg=None):
+        if cfg is None:
+            cfg = asdict(self.probe_cfg)
+        logging.info('Config saved to %s', Env.CFGFILE)
+        with open(Env.CFGFILE, 'w+') as fp:
+            json.dump(cfg, fp, indent=4)
 
     def __enter__(self):
         self.open()
@@ -241,45 +243,59 @@ class LoopStateMachine:
 
     def open(self):
         self.capture = CaptureDevice(self.capture_cfg)
+        self.dbus = MPRISConnector(self.rxq)
         self.capture.open()
+        self.dbus.open()
 
     def close(self):
         self.capture.close()
+        self.dbus.close()
+
+    @property
+    def state(self):
+        return self._local_state
+
+    @state.setter
+    def state(self, val):
+        self._local_state = val
+        try:
+            self.dbus.player.PlaybackStatus = MPRISStatus[val]
+        except AttributeError:
+            logging.warning('Cannot connect to DBus.')
+
 
     async def run(self):
-        TaskInfo = namedtuple('TaskInfo', ['state', 'delay', 'coro'])
+        TaskInfo = namedtuple('TaskInfo', ['local_state', 'delay', 'coro'])
         manifests = {
-            PlayerCommand.STOP: TaskInfo(PlayerState.HYBERNATE,
-                                         self.probe_cfg.hybernate_interval,
-                                         self._wakeup),
-            PlayerCommand.PLAY: TaskInfo(PlayerState.IDLE, 0, self._idle)
+            PlayerCommand.STOP:  TaskInfo(PlayerState.HYBERNATE,
+                                          self.probe_cfg.hybernate_interval,
+                                          self._idle),
+            PlayerCommand.PLAY:  TaskInfo(PlayerState.IDLE, 0, self._idle),
         }
 
         self.loop = asyncio.get_running_loop()
-        await self.queue.put(PlayerCommand.PLAY)
+        await self.rxq.put(PlayerCommand.PLAY)
 
         while self.state is not PlayerState.KILLED:
-            cmd = await self.queue.get()
+            cmd = await self.rxq.get()
+            logging.info('Dispatch command %s', cmd)
             await self._gather()
 
             todo = manifests[cmd]
-            self.state = todo.state
+            self.state = todo.local_state
             self.loop.call_later(todo.delay, asyncio.create_task, todo.coro())
-
-    async def _wakeup(self):
-        self.state = PlayerState.IDLE
-        self.loop.create_task(self._idle())
+            self.rxq.task_done()
 
     async def _idle(self):
         while self.state == PlayerState.IDLE:
             self.buffer = self.capture.read()
-            med = self._smp_median(self.buffer)
+            med = self.__smp_median(self.buffer)
             if med > self.thresholds.start:
                 self.counter += 1
-                logging.debug(f'probe_idle: {med:.0f} > {self.thresholds.start:.0f}, {self.counter=}')
             else:
                 self.counter = 0
-                logging.debug(f'probe_idle: {med:.0f} < {self.thresholds.start:.0f}, {self.counter=}')
+
+            logging.debug('polled %.0f <> threshold %.0f, counter=%d', med, self.thresholds.start, self.counter)
 
             if self.counter >= self.probe_cfg.start_count:
                 self.counter = 0
@@ -294,13 +310,13 @@ class LoopStateMachine:
 
     async def _monitor(self):
         while self.state == PlayerState.PLAY:
-            med = self._smp_median(self.buffer)
+            med = self.__smp_median(self.buffer)
             if med < self.thresholds.stop:
                 self.counter += 1
-                logging.debug(f'probe_stream: {med:.0f} < {self.thresholds.stop:.0f}, {self.counter=}')
             else:
                 self.counter = 0
-                logging.debug(f'probe_stream: {med:.0f} > {self.thresholds.stop:.0f}, {self.counter=}')
+
+            logging.debug('polled %.0f <> threshold %.0f, counter=%d', med, self.thresholds.stop, self.counter)
 
             if self.counter >= self.probe_cfg.stop_count:
                 self.state = PlayerState.IDLE
@@ -313,7 +329,7 @@ class LoopStateMachine:
                 await asyncio.sleep(self.probe_cfg.stream_interval)
 
     async def _stream(self):
-        logging.info(f'start redirecting [{self.capture.name}] => [{self.playback_pcm_name}]')
+        logging.info('start redirecting [%s] => [%s]', self.capture.name, self.playback_cfg.pcm_name)
 
         with PlaybackDevice(self.playback_cfg) as playback:
             playback.write(self.buffer)
@@ -331,32 +347,30 @@ class LoopStateMachine:
 
         [task.cancel() for task in tasks]
 
-        logging.info(f"Cancelling {len(tasks)} outstanding tasks")
+        logging.info('Cancelling %d outstanding tasks', len(tasks))
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _restart(self, sig):
         self.state = PlayerState.UNKNOWN
-        logging.info(f'Received restart signal {sig.name}.')
+        logging.info('Received restart signal %s.', sig.name)
         await self._gather()
-        self.loop.create_task(self._idle())
+        self.probe_cfg = self.__load_config()
+        self.loop.create_task(self.run())
 
     async def _shutdown(self, sig):
         self.state = PlayerState.KILLED
-        logging.info(f'Received exit signal {sig.name}...')
+        logging.info('Received exit signal %s.', sig.name)
         await self._gather()
+        self.close()
         self.loop.stop()
 
-    def _smp_median(self, buffer, n_sample=5):
-        sumsq = []
-        samples = islice(MemScope(buffer, self.capture_cfg), n_sample)
-        data = [abs(val - self.capture_cfg.reference) for packet in samples for val in packet]
-
-        return statistics.median(data)
 
 
 def main():
+    logging.captureWarnings(True)
+    logging.basicConfig(level=logging.INFO)
+
     loop = asyncio.get_event_loop()
-    queue = asyncio.Queue()
 
     shutdown_signals = (signal.SIGTERM, signal.SIGINT)
     stop_signals = (signal.SIGUSR1, )
@@ -365,25 +379,25 @@ def main():
     capture_cfg = AlsaDeviceConfig('sysdefault:CARD=system', pcm_data_format='PCM_FORMAT_S16_LE')
     playback_cfg = AlsaDeviceConfig('default', pcm_data_format='PCM_FORMAT_S16_LE')
 
-    with LoopStateMachine(queue, capture_cfg, playback_cfg) as redirector:
+    with LoopStateMachine(capture_cfg, playback_cfg) as usbloop:
 
         try:
             for s in shutdown_signals:
                 loop.add_signal_handler(
                     s, lambda s=s: 
-                        asyncio.create_task(redirector._shutdown(s)))
+                        asyncio.create_task(usbloop._shutdown(s)))
 
             for s in stop_signals:
                 loop.add_signal_handler(
                     s, lambda s=s:
-                        asyncio.create_task(redirector._shutdown(s)))
+                        asyncio.create_task(usbloop._shutdown(s)))
 
             for s in restart_signals:
                 loop.add_signal_handler(
                     s, lambda s=s:
-                        asyncio.create_task(redirector._restart(s)))
+                        asyncio.create_task(usbloop._restart(s)))
 
-            loop.create_task(redirector.run())
+            loop.create_task(usbloop.run())
             loop.run_forever()
 
         finally:
@@ -393,4 +407,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

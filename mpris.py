@@ -25,401 +25,166 @@
 
 import sys
 import logging
-import time
-import threading
-import subprocess
-import signal
-import json
+
+from threading import Thread 
+from dataclasses import dataclass, asdict
+from typing import Dict
 
 import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
 
-# python dbus bindings don't include annotations and properties
-MPRIS2_INTROSPECTION = """<node name="/org/mpris/MediaPlayer2">
-  <interface name="org.freedesktop.DBus.Introspectable">
-    <method name="Introspect">
-      <arg direction="out" name="xml_data" type="s"/>
-    </method>
-  </interface>
-  <interface name="org.freedesktop.DBus.Properties">
-    <method name="Get">
-      <arg direction="in" name="interface_name" type="s"/>
-      <arg direction="in" name="property_name" type="s"/>
-      <arg direction="out" name="value" type="v"/>
-    </method>
-    <method name="GetAll">
-      <arg direction="in" name="interface_name" type="s"/>
-      <arg direction="out" name="properties" type="a{sv}"/>
-    </method>
-    <method name="Set">
-      <arg direction="in" name="interface_name" type="s"/>
-      <arg direction="in" name="property_name" type="s"/>
-      <arg direction="in" name="value" type="v"/>
-    </method>
-    <signal name="PropertiesChanged">
-      <arg name="interface_name" type="s"/>
-      <arg name="changed_properties" type="a{sv}"/>
-      <arg name="invalidated_properties" type="as"/>
-    </signal>
-  </interface>
-  <interface name="org.mpris.MediaPlayer2">
-    <method name="Raise"/>
-    <method name="Quit"/>
-    <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="false"/>
-    <property name="CanQuit" type="b" access="read"/>
-    <property name="CanRaise" type="b" access="read"/>
-    <property name="HasTrackList" type="b" access="read"/>
-    <property name="Identity" type="s" access="read"/>
-    <property name="DesktopEntry" type="s" access="read"/>
-    <property name="SupportedUriSchemes" type="as" access="read"/>
-    <property name="SupportedMimeTypes" type="as" access="read"/>
-  </interface>
-  <interface name="org.mpris.MediaPlayer2.Player">
-    <method name="Next"/>
-    <method name="Previous"/>
-    <method name="Pause"/>
-    <method name="PlayPause"/>
-    <method name="Stop"/>
-    <method name="Play"/>
-    <method name="Seek">
-      <arg direction="in" name="Offset" type="x"/>
-    </method>
-    <method name="SetPosition">
-      <arg direction="in" name="TrackId" type="o"/>
-      <arg direction="in" name="Position" type="x"/>
-    </method>
-    <method name="OpenUri">
-      <arg direction="in" name="Uri" type="s"/>
-    </method>
-    <signal name="Seeked">
-      <arg name="Position" type="x"/>
-    </signal>
-    <property name="PlaybackStatus" type="s" access="read">
-      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="true"/>
-    </property>
-    <property name="LoopStatus" type="s" access="readwrite">
-      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="true"/>
-    </property>
-    <property name="Rate" type="d" access="readwrite">
-      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="true"/>
-    </property>
-    <property name="Shuffle" type="b" access="readwrite">
-      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="true"/>
-    </property>
-    <property name="Metadata" type="a{sv}" access="read">
-      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="true"/>
-    </property>
-    <property name="Volume" type="d" access="readwrite">
-      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="false"/>
-    </property>
-    <property name="Position" type="x" access="read">
-      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="false"/>
-    </property>
-    <property name="MinimumRate" type="d" access="read">
-      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="true"/>
-    </property>
-    <property name="MaximumRate" type="d" access="read">
-      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="true"/>
-    </property>
-    <property name="CanGoNext" type="b" access="read">
-      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="true"/>
-    </property>
-    <property name="CanGoPrevious" type="b" access="read">
-      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="true"/>
-    </property>
-    <property name="CanPlay" type="b" access="read">
-      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="true"/>
-    </property>
-    <property name="CanPause" type="b" access="read">
-      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="true"/>
-    </property>
-    <property name="CanSeek" type="b" access="read">
-      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="true"/>
-    </property>
-    <property name="CanControl" type="b" access="read">
-      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="false"/>
-    </property>
-  </interface>
-</node>"""
+from config import *
 
 
-class ALSALoopWrapper(threading.Thread):
-    """ Wrapper to handle internal alsaloop
-    """
+@dataclass
+class DBusRuntimeObject:
+    broadcast_name : str
+    unique_name: str
+    bus_name: dbus.service.BusName
+    thread: Thread
+    bus: dbus._dbus.SystemBus
+    obj: dbus.proxies.ProxyObject
 
-    def __init__(self, auto_start = True):
+
+class DBusThread(Thread):
+    def __init__(self):
         super().__init__()
-        self.playerid = None
-        self.playback_status = "stopped"
-        self.metadata = {}
-
-        self.dbus_service = None
-
-        self.bus = dbus.SessionBus()
-        self.received_data = False
-        
-        self.auto_start = auto_start
-
-        self.playback = None
-        self.record = None
-        
-        self.alsaloopclient = None
-        
-        self.alsaloopdb = 0
+        DBusGMainLoop(set_as_default=True)
+        self.loop = GLib.MainLoop()
 
     def run(self):
-        try:
-            self.dbus_service = MPRISInterface()
+        self.loop.run()
 
-            self.mainloop_external()
-
-        except Exception as e:
-            logging.error("Alsaloopwrapper thread exception: %s", e)
-            sys.exit(1)
+    def stop(self):
+        self.loop.quit()
 
 
-    def mainloop_external(self):
-        while True:
-            if self.alsaloopclient is None:
-                cmdline = "python /opt/alsaloop/alsaloop.py {}".format(self.alsaloopdb)
-                logging.info("starting %s",cmdline)
-                self.alsaloopclient = \
-                    subprocess.Popen(cmdline,
-                                        bufsize=1,
-                                        stdout=subprocess.PIPE,
-                                        shell=True,
-                                        universal_newlines=True,
-                                        encoding="utf-8",
-                                        text=True)
-                logging.info("alsaloop now running in background")
+class MPRISConnector(dbus.service.Object):
+    def __init__(self, tx_queue):
+        self.txq = tx_queue
+        self.player = DBusPlayerProperty()
+        self.mpris = DBusMPRISProperty()
+        self.dbus = None
 
-            # Check if alsaloop is still running
-            if self.alsaloopclient:
-                if self.alsaloopclient.poll() is not None:
-                    logging.warning("alsaloop died")
-                    self.playback_status = PLAYBACK_STOPPED
-                    self.alsaloopclient = None
-                    continue
-                    
-            line = self.alsaloopclient.stdout.readline()
+        with open(DBusConfig.introspect_xml, 'r') as fp:
+            self.introspect_xml = fp.read()
 
-            pbstatus_old = self.playback_status
+        self.ifacemap = {
+                DBusConfig.player_iface : self.player,
+                DBusConfig.mpris_iface  : self.mpris
+        }
 
-            # Use the first character of the line for active/inactive state detection
-            if line[0] == "A":
-                self.playback_status = PLAYBACK_PLAYING
-            elif line[0] == "-":
-                self.playback_status = PLAYBACK_STOPPED
-                    
-            # Ignore decibel for the moment
-            #try:
-            #    db = float(parts[1])
-            #except:
-            #    db = 0
+    def open(self):
+        broadcast_name = f'{DBusConfig.mpris_iface}.{PACKAGE_NAME}'
 
-            if self.playback_status != pbstatus_old:
-                logging.info("playback status changed from %s to %s",pbstatus_old, self.playback_status)
-            
-            # Playback status has changed, now inform DBUS
-            self.update_metadata()
-            self.dbus_service.update_property('org.mpris.MediaPlayer2.Player',
-                                                  'PlaybackStatus')
+        dbus_thread = DBusThread()
+        dbus.service.Object.__init__(self, dbus.SystemBus(), DBusConfig.path)
 
-    def reconfigure(self):
-        if self.alsaloopclient is not None:
-            self.alsaloopclient.kill()
-            self.alsaloopclient = None
-            self.playback_status=PLAYBACK_UNKNOWN
-            
-    def update_metadata(self):
-        if self.alsaloopclient is not None:
-            self.metadata["xesam:url"] = \
-                "alsaloop://"
+        bus = dbus.SystemBus()
+        dbus_obj = bus.get_object(
+                'org.freedesktop.DBus', '/org/freedesktop/DBus')
+        dbus_obj.connect_to_signal(
+                'NameOwnerChanged', self.change_owner_cb, arg0=broadcast_name)
 
-        self.dbus_service.update_property('org.mpris.MediaPlayer2.Player',
-                                                  'Metadata')
+        self.dbus = DBusRuntimeObject(
+                broadcast_name,
+                bus.get_unique_name(),
+                dbus.service.BusName(
+                    broadcast_name, bus=bus, allow_replacement=True, replace_existing=True),
+                dbus_thread,
+                bus,
+                dbus_obj
+        )
 
+        dbus_thread.start()
+        logging.info('DBus thread started at %s as %s',
+                     self.dbus.unique_name, broadcast_name)
 
-class MPRISInterface(dbus.service.Object):
-    ''' The base object of an MPRIS player '''
+    def close(self):
+        self.dbus.bus.close()
+        self.dbus.thread.stop()
 
-    PATH = "/org/mpris/MediaPlayer2"
-    INTROSPECT_INTERFACE = "org.freedesktop.DBus.Introspectable"
-    PROP_INTERFACE = dbus.PROPERTIES_IFACE
-    ROOT_INTERFACE = "org.mpris.MediaPlayer2"
-    ROOT_PROPS = {
-        "CanQuit": (False, None),
-        "CanRaise": (False, None),
-        "DesktopEntry": ("alsaloopmpris", None),
-        "HasTrackList": (False, None),
-        "Identity": (identity, None),
-        "SupportedUriSchemes": (dbus.Array(signature="s"), None),
-        "SupportedMimeTypes": (dbus.Array(signature="s"), None)
-    }
-
-    def __init__(self):
-        dbus.service.Object.__init__(self, dbus.SystemBus(),
-                                     MPRISInterface.PATH)
-        self.name = "org.mpris.MediaPlayer2.usbloop"
-        self.bus = dbus.SystemBus()
-        self.uname = self.bus.get_unique_name()
-        self.dbus_obj = self.bus.get_object("org.freedesktop.DBus",
-                                            "/org/freedesktop/DBus")
-        self.dbus_obj.connect_to_signal("NameOwnerChanged",
-                                        self.name_owner_changed_callback,
-                                        arg0=self.name)
-
-        self.acquire_name()
-        logging.info("name on DBus aqcuired")
-
-    def name_owner_changed_callback(self, name, old_owner, new_owner):
-        if name == self.name and old_owner == self.uname and new_owner != "":
+    def change_owner_cb(self, name, old_owner, new_owner):
+        if str(name) == self.dbus.broadcast_name \
+           and str(old_owner) == self.dbus.unique_name \
+           and str(new_owner) != '':
             try:
-                pid = self._dbus_obj.GetConnectionUnixProcessID(new_owner)
+                pid = self.dbus_obj.GetConnectionUnixProcessID(new_owner)
             except:
                 pid = None
             logging.info("Replaced by %s (PID %s)" %
                          (new_owner, pid or "unknown"))
-            loop.quit()
+            self.dbus.thread.stop()
 
-    def acquire_name(self):
-        self.bus_name = dbus.service.BusName(self.name,
-                                             bus=self.bus,
-                                             allow_replacement=True,
-                                             replace_existing=True)
+    def __enter__(self):
+        self.open()
+        return self
 
-    def release_name(self):
-        if hasattr(self, "_bus_name"):
-            del self.bus_name
+    def __exit__(self, *_):
+        self.close()
 
-
-    @dbus.service.method(INTROSPECT_INTERFACE)
+    @dbus.service.method(DBusConfig.introspect_iface)
     def Introspect(self):
-        return MPRIS2_INTROSPECTION
+        return self.introspect_xml
 
-    def get_playback_status():
-        status = alsaloop_wrapper.playback_status
-        return {PLAYBACK_PLAYING: 'Playing',
-                PLAYBACK_PAUSED: 'Paused',
-                PLAYBACK_STOPPED: 'Stopped',
-                PLAYBACK_UNKNOWN: 'Unknown'}[status]
-
-    @property
-    def get_metadata(self):
-        return dbus.Dictionary(alsaloop_wrapper.metadata, signature='sv')
-
-    PLAYER_INTERFACE = "org.mpris.MediaPlayer2.Player"
-    PLAYER_PROPS = {
-        "PlaybackStatus": (get_playback_status, None),
-        "Rate": (1.0, None),
-        "Metadata": (get_metadata, None),
-        "MinimumRate": (1.0, None),
-        "MaximumRate": (1.0, None),
-        "CanGoNext": (False, None),
-        "CanGoPrevious": (False, None),
-        "CanPlay": (True, None),
-        "CanPause": (True, None),
-        "CanSeek": (False, None),
-        "CanControl": (False, None),
-    }
-
-    PROP_MAPPING = {
-        PLAYER_INTERFACE: PLAYER_PROPS,
-        ROOT_INTERFACE: ROOT_PROPS,
-    }
-
-    @dbus.service.signal(PROP_INTERFACE, signature="sa{sv}as")
+    @dbus.service.signal(DBusConfig.property_iface, signature="sa{sv}as")
     def PropertiesChanged(self, interface, changed_properties,
                           invalidated_properties):
         pass
 
-    @dbus.service.method(PROP_INTERFACE,
+    @dbus.service.method(DBusConfig.property_iface,
                          in_signature="ss", out_signature="v")
-    def Get(self, interface, prop):
-        getter, _setter = self.PROP_MAPPING[interface][prop]
-        return getter
+    def Get(self, interface, key):
+        ret = getattr(self.ifacemap[str(interface)], key)
+        logging.debug('Return attribute on %s[%s]: %s', str(interface), key, ret)
+        return getattr(self.ifacemap[str(interface)], key)
 
-    @dbus.service.method(PROP_INTERFACE,
+    @dbus.service.method(DBusConfig.property_iface,
                          in_signature="ssv", out_signature="")
-    def Set(self, interface, prop, value):
-        _getter, setter = self.PROP_MAPPING[interface][prop]
-        if setter is not None:
-            setter(value)
+    def Set(self, interface, key, value):
+        try:
+            setattr(self.ifacemap[str(interface)], key, value)
+            logging.debug('Set attribute on %s[%s]: %s', str(interface), key, value)
+        except AttributeError:
+            pass
 
-    @dbus.service.method(PROP_INTERFACE,
+    @dbus.service.method(DBusConfig.property_iface,
                          in_signature="s", out_signature="a{sv}")
     def GetAll(self, interface):
-        read_props = {}
-        props = self.PROP_MAPPING[interface]
-        for key, (getter, _setter) in props.items():
-            if callable(getter):
-                getter = getter()
-            read_props[key] = getter
-        return read_props
-
-    def update_property(self, interface, prop):
-        getter, _setter = self.PROP_MAPPING[interface][prop]
-        if callable(getter):
-            value = getter()
-        else:
-            value = getter
-        logging.debug('Updated property: %s = %s' % (prop, value))
-        self.PropertiesChanged(interface, {prop: value}, [])
-        return value
+        logging.debug('Return all attributes on %s', str(interface))
+        return asdict(self.ifacemap[str(interface)])
 
     # Player methods
-    @dbus.service.method(PLAYER_INTERFACE, in_signature='', out_signature='')
+    @dbus.service.method(DBusConfig.player_iface, in_signature='', out_signature='')
     def Pause(self):
-        logging.debug("received DBUS pause")
-        alsaloop_wrapper.playback_status = PLAYBACK_STOPPED
+        logging.debug('Received DBus pause')
+        self.txq.put(PlayerCommand.STOP)
         return
 
-    @dbus.service.method(PLAYER_INTERFACE, in_signature='', out_signature='')
+    @dbus.service.method(DBusConfig.player_iface, in_signature='', out_signature='')
     def PlayPause(self):
-        logging.debug("received DBUS play/pause")
-        status = alsaloop_wrapper.playback_status
+        logging.debug('Received DBus play/pause')
 
-        if status == PLAYBACK_PLAYING:
-            alsaloop_wrapper.playback_status = PLAYBACK_STOPPED
+        if self.playback_status in [PlayerState.PLAY, PlayerState.IDLE]:
+            self.txq.put(PlayerCommand.STOP)
         else:
-            alsaloop_wrapper.playback_status = PLAYBACK_PLAYING
+            self.txq.put(PlayerCommand.PLAY)
         return
 
-    @dbus.service.method(PLAYER_INTERFACE, in_signature='', out_signature='')
+    @dbus.service.method(DBusConfig.player_iface, in_signature='', out_signature='')
     def Stop(self):
-        logging.debug("received DBUS stop")
-        alsaloop_wrapper.playback_status = PLAYBACK_STOPPED
+        logging.debug('Received DBus stop')
+        self.txq.put(PlayerCommand.STOP)
         return
 
-    @dbus.service.method(PLAYER_INTERFACE, in_signature='', out_signature='')
+    @dbus.service.method(DBusConfig.player_iface, in_signature='', out_signature='')
     def Play(self):
-        alsaloop_wrapper.playback_status = PLAYBACK_PLAYING
+        self.txq.put(PlayerCommand.PLAY) 
         return
 
 
-def stop_alsaloop(_signalNumber, _frame):
-    logging.info("received USR1, stopping alsaloop")
-    alsaloop_wrapper.playback_status = PLAYBACK_STOPPED
-
-
-def reconfigure_alsaloop(_signalNumber, _frame):
-    logging.info("received HUP, reconfiguring alsaloop")
-    parse_config(alsaloop_wrapper)
-
-
-def parse_config(alsaloop_wrapper, debugmode=False):
-    try:
-        with open('/etc/alsaloop.json') as json_file:
-            data = json.load(json_file)
-            alsaloop_wrapper.alsaloopdb = data["sensitivity"]
-    except:
-        logging.info("couldn't read /etc/alsaloop.json, using default configuration")
-        
-    alsaloop_wrapper.reconfigure()
-    
-
-if __name__ == '__main__':
-    DBusGMainLoop(set_as_default=True)
-
+def config_logger():
     if len(sys.argv) > 1:
         if "-v" in sys.argv:
             logging.basicConfig(format='%(levelname)s: %(name)s - %(message)s',
@@ -429,30 +194,4 @@ if __name__ == '__main__':
         logging.basicConfig(format='%(levelname)s: %(name)s - %(message)s',
                             level=logging.INFO)
 
-    # Set up the main loop
-    loop = GLib.MainLoop()
 
-    signal.signal(signal.SIGUSR1, stop_alsaloop)
-    signal.signal(signal.SIGHUP, reconfigure_alsaloop)
-
-    # Create wrapper to manages the alsaloop child process
-    try:
-        alsaloop_wrapper = ALSALoopWrapper()
-        parse_config(alsaloop_wrapper)
-        alsaloop_wrapper.start()
-        logging.info("alsaloop wrapper thread started")
-    except dbus.exceptions.DBusException as e:
-        logging.error("DBUS error: %s", e)
-        sys.exit(1)
-
-    time.sleep(2)
-    if not (alsaloop_wrapper.is_alive()):
-        logging.error("alsaloop connector thread died, exiting")
-        sys.exit(1)
-
-    # Run idle loop
-    try:
-        logging.info("main loop started")
-        loop.run()
-    except KeyboardInterrupt:
-        logging.debug('Caught SIGINT, exiting.')
