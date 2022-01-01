@@ -41,7 +41,7 @@ MPRISStatus = {
     PlayerState.UNKNOWN   : 'unknown' }
 
 Env = SimpleNamespace(
-    CFGFILE=Path('/etc/usbloop.json'))
+    CFGFILE=Path(f'/etc/{PACKAGE_NAME}.json'))
 
 
 class UpdatableDataclass:
@@ -53,11 +53,11 @@ class UpdatableDataclass:
 
 @dataclass
 class ProbeConfig(UpdatableDataclass):
-    sensitivity_db: float = -60
+    sensitivity: float = -60
     idle_interval: float = 0.25
     follow_interval: float = 0.1
     stream_interval: float = 2.0
-    hybernate_interval: float = 60
+    hybernate_interval: float = 15
     start_count: int = 3
     stop_count: int = 10
 

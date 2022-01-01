@@ -25,10 +25,10 @@
 
 import sys
 import logging
+import asyncio
 
 from threading import Thread 
 from dataclasses import dataclass, asdict
-from typing import Dict
 
 import dbus.service
 from dbus.mainloop.glib import DBusGMainLoop
@@ -60,12 +60,32 @@ class DBusThread(Thread):
         self.loop.quit()
 
 
+class ThreadSafeAIOQueue:
+    def __init__(self, queue: asyncio.Queue):
+        self.queue = queue
+
+    def put(self, payload):
+        logging.debug('sending command over queue: %s', payload)
+        loop = asyncio.get_running_loop()
+        loop.call_soon_threadsafe(self.queue.put_nowait, payload)
+        #future = asyncio.run_coroutine_threadsafe(
+        #            self.queue.put(payload), loop)
+        #return future.result(0.1)
+
+    def get(self):
+        loop = asyncio.get_running_loop()
+        future = asyncio.run_coroutine_threadsafe(
+                    self.queue.get(), loop)
+        return future.result(0.1)
+
+
 class MPRISConnector(dbus.service.Object):
     def __init__(self, tx_queue):
         self.txq = tx_queue
         self.player = DBusPlayerProperty()
         self.mpris = DBusMPRISProperty()
         self.dbus = None
+        self.aioloop = None
 
         with open(DBusConfig.introspect_xml, 'r') as fp:
             self.introspect_xml = fp.read()
@@ -100,6 +120,9 @@ class MPRISConnector(dbus.service.Object):
         dbus_thread.start()
         logging.info('DBus thread started at %s as %s',
                      self.dbus.unique_name, broadcast_name)
+
+    def set_main_loop(self, loop):
+        self.aioloop = loop
 
     def close(self):
         self.dbus.bus.close()
@@ -159,29 +182,29 @@ class MPRISConnector(dbus.service.Object):
     @dbus.service.method(DBusConfig.player_iface, in_signature='', out_signature='')
     def Pause(self):
         logging.debug('Received DBus pause')
-        self.txq.put(PlayerCommand.STOP)
-        return
+        future = asyncio.run_coroutine_threadsafe(self.txq.put(PlayerCommand.STOP), self.aioloop)
+        return future.result(0.1)
 
     @dbus.service.method(DBusConfig.player_iface, in_signature='', out_signature='')
     def PlayPause(self):
         logging.debug('Received DBus play/pause')
 
         if self.playback_status in [PlayerState.PLAY, PlayerState.IDLE]:
-            self.txq.put(PlayerCommand.STOP)
+            future = asyncio.run_coroutine_threadsafe(self.txq.put(PlayerCommand.STOP), self.aioloop)
         else:
-            self.txq.put(PlayerCommand.PLAY)
-        return
+            future = asyncio.run_coroutine_threadsafe(self.txq.put(PlayerCommand.STOP), self.aioloop)
+        return future.result(0.1)
 
     @dbus.service.method(DBusConfig.player_iface, in_signature='', out_signature='')
     def Stop(self):
         logging.debug('Received DBus stop')
-        self.txq.put(PlayerCommand.STOP)
-        return
+        future = asyncio.run_coroutine_threadsafe(self.txq.put(PlayerCommand.STOP), self.aioloop)
+        return future.result(0.1)
 
     @dbus.service.method(DBusConfig.player_iface, in_signature='', out_signature='')
     def Play(self):
-        self.txq.put(PlayerCommand.PLAY) 
-        return
+        future = asyncio.run_coroutine_threadsafe(self.txq.put(PlayerCommand.PLAY), self.aioloop)
+        return future.result(0.1)
 
 
 def config_logger():

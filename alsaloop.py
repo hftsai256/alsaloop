@@ -1,11 +1,7 @@
-#!/usr/bin/env python
-
 import io
-import os
 import re
 import json
 import struct
-import signal
 import logging
 import asyncio
 import warnings
@@ -14,7 +10,7 @@ import statistics
 from typing import Optional
 from itertools import islice
 from collections import namedtuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 from mpris import MPRISConnector
 from config import *
@@ -76,7 +72,7 @@ class AlsaDevice:
     device: alsaaudio.PCM = None
 
     def __init__(self, cfg: AlsaDeviceConfig = AlsaDeviceConfig()):
-        self.name = cfg.pcm_name
+        self.name = self._pick(cfg.pcm_name)
         self.cfg = cfg
 
     def __enter__(self):
@@ -87,7 +83,8 @@ class AlsaDevice:
         self.close()
 
     def open(self):
-        self.device = alsaaudio.PCM(self.dev_type, self.dev_mode, device=self.cfg.pcm_name)
+        logging.info('Open PCM on card %s', self.name)
+        self.device = alsaaudio.PCM(self.dev_type, self.dev_mode, device=self.name)
         self.device.setchannels(self.cfg.channels)
         self.device.setrate(self.cfg.rate)
         self.device.setformat(getattr(alsaaudio, self.cfg.format))
@@ -95,6 +92,17 @@ class AlsaDevice:
 
     def close(self):
         self.device.close()
+
+    def _pick(self, name):
+        pcms = alsaaudio.pcms(self.dev_type)
+        if name == 'default' or name in pcms:
+            return name
+
+        try:
+            ret = [n for n in pcms if 'sysdefault:CARD' in n][0]
+        except IndexError:
+            ret = 'default'
+        return  ret
 
 
 class CaptureDevice(AlsaDevice):
@@ -121,7 +129,7 @@ class PlaybackDevice(AlsaDevice):
             written = self.device.write(data)
 
             if written == 0:
-                warnings.warn(f'Buffer full', RuntimeWarning)
+                logging.warning('Write buffer full on playback')
                 continue
 
             return written
@@ -199,13 +207,16 @@ class LoopStateMachine:
         self.buffer = b''
 
         Thresholds = namedtuple('Thresholds', ['start', 'stop'])
-        self.thresholds = Thresholds(
-                self.__reverse_db(self.probe_cfg.sensitivity_db),
-                self.__reverse_db(self.probe_cfg.sensitivity_db - 3)
-        )
+        tdb = -abs(self.probe_cfg.sensitivity)
+        if tdb == 0:
+            self.thresholds = Thresholds(0, 0)
+        else:
+            self.thresholds = Thresholds(
+                self.__reverse_db(tdb),
+                self.__reverse_db(tdb - 3))
 
     def __reverse_db(self, db):
-        return self.capture_cfg.maxamp * 10**(-abs(db)/20)
+        return self.capture_cfg.maxamp * 10**(db/20)
 
     def __smp_median(self, buffer, n_sample=20):
         """Calculated median from data across all channels.
@@ -224,16 +235,7 @@ class LoopStateMachine:
                 logging.info('Load config from %s', Env.CFGFILE)
         except (FileNotFoundError, json.decoder.JSONDecodeError):
             logging.info('Cannot read %s. Using default configuration', Env.CFGFILE)
-            #TODO: Is there a better place to save config?
-            self.__save_config(cfg=asdict(default))
         return default
-
-    def __save_config(self, cfg=None):
-        if cfg is None:
-            cfg = asdict(self.probe_cfg)
-        logging.info('Config saved to %s', Env.CFGFILE)
-        with open(Env.CFGFILE, 'w+') as fp:
-            json.dump(cfg, fp, indent=4)
 
     def __enter__(self):
         self.open()
@@ -276,6 +278,7 @@ class LoopStateMachine:
         }
 
         self.loop = asyncio.get_running_loop()
+        self.dbus.aioloop = self.loop
         await self.rxq.put(PlayerCommand.PLAY)
 
         while self.state is not PlayerState.KILLED:
@@ -370,41 +373,3 @@ class LoopStateMachine:
         self.close()
         self.loop.stop()
 
-
-
-def main():
-    logging.captureWarnings(True)
-    logging.basicConfig(level=logging.INFO)
-
-    logging.info('usbloop start as PID %d', os.getpid())
-    loop = asyncio.get_event_loop()
-
-    shutdown_signals = (signal.SIGTERM, signal.SIGINT)
-    restart_signals = (signal.SIGHUP, signal.SIGUSR1)
-
-    capture_cfg = AlsaDeviceConfig('sysdefault:CARD=system', pcm_data_format='PCM_FORMAT_S16_LE')
-    playback_cfg = AlsaDeviceConfig('default', pcm_data_format='PCM_FORMAT_S16_LE')
-
-    with LoopStateMachine(capture_cfg, playback_cfg) as usbloop:
-
-        try:
-            for s in shutdown_signals:
-                loop.add_signal_handler(
-                    s, lambda s=s: 
-                        asyncio.create_task(usbloop._shutdown(s)))
-
-            for s in restart_signals:
-                loop.add_signal_handler(
-                    s, lambda s=s:
-                        asyncio.create_task(usbloop._restart(s)))
-
-            loop.create_task(usbloop.run())
-            loop.run_forever()
-
-        finally:
-            loop.close()
-            logging.info('Sucessfully shutdown usbloop')
-
-
-if __name__ == '__main__':
-    main()
