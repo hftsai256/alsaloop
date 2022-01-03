@@ -354,13 +354,17 @@ class LoopStateMachine:
     async def _stream(self):
         logging.info('start redirecting [%s] => [%s]', self.capture.name, self.playback_cfg.pcm_name)
 
-        with PlaybackDevice(self.playback_cfg) as playback:
-            playback.write(self._buffer)
-
-            while self.state == PlayerState.PLAY:
-                self._buffer = self.capture.read()
+        try:
+            with PlaybackDevice(self.playback_cfg) as playback:
                 playback.write(self._buffer)
-                await asyncio.sleep(0.001)
+
+                while self.state == PlayerState.PLAY:
+                    self._buffer = self.capture.read()
+                    playback.write(self._buffer)
+                    await asyncio.sleep(0.001)
+        except alsaaudio.ALSAAudioError as e:
+            logging.info('Error opening playback device: %s', e)
+            await self.rxq.put(PlayerCommand.STOP)
 
         logging.info('close playback')
 
