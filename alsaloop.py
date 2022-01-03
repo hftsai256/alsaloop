@@ -1,6 +1,7 @@
 import io
 import re
 import json
+import time
 import struct
 import logging
 import asyncio
@@ -83,7 +84,6 @@ class AlsaDevice:
         self.close()
 
     def open(self):
-        logging.info('Open PCM on card %s', self.name)
         self.device = alsaaudio.PCM(self.dev_type, self.dev_mode, device=self.name)
         self.device.setchannels(self.cfg.channels)
         self.device.setrate(self.cfg.rate)
@@ -119,6 +119,7 @@ class CaptureDevice(AlsaDevice):
                 warnings.warn(f'Broken Pipe: {length}', RuntimeWarning)
             else:
                 warnings.warn(f'Unknown Error: Code={length}', RuntimeWarning)
+            time.sleep(0.010)
 
 
 class PlaybackDevice(AlsaDevice):
@@ -191,40 +192,59 @@ class MemScope:
         return (f'{endian}{body}')
 
 
+class HystComp:
+    def __init__(self, low: float, high: float):
+        logging.debug('hysteresis comparator registered as (%.1f, %.1f)', low, high)
+        self.low = low
+        self.high = high
+
+    def __repr__(self):
+        return f'<HystComp({self.low:.2e}, {self.high:.2e}>'
+
+    def comp(self, val):
+        CompResult = namedtuple('HystCompResult', ['low', 'high'])
+        return CompResult(val <= self.low, val >= self.high)
+
+
 class LoopStateMachine:
     def __init__(self,
                  capture_cfg: AlsaDeviceConfig,
                  playback_cfg: AlsaDeviceConfig):
         self.rxq = asyncio.Queue()
-        self._local_state = PlayerState.UNKNOWN
-        self.counter = 0
-        self.is_streaming = False
         self.capture_cfg = capture_cfg
         self.playback_cfg = playback_cfg
         self.probe_cfg = self.__load_config()
         self.capture = None
         self.dbus = None
-        self.buffer = b''
+        self.probe = self.probe_cfg.sensitivity
 
-        Thresholds = namedtuple('Thresholds', ['start', 'stop'])
-        tdb = -abs(self.probe_cfg.sensitivity)
-        if tdb == 0:
-            self.thresholds = Thresholds(0, 0)
-        else:
-            self.thresholds = Thresholds(
-                self.__reverse_db(tdb),
-                self.__reverse_db(tdb - 3))
+        self._local_state = PlayerState.UNKNOWN
+        self._buffer = b''
 
     def __reverse_db(self, db):
         return self.capture_cfg.maxamp * 10**(db/20)
 
-    def __smp_median(self, buffer, n_sample=20):
+    @property
+    def probe(self):
         """Calculated median from data across all channels.
-           Takes around 0.5 ms at 20 frames on setero data. Slow but acceptable.
+           Takes around 1 ms at 40 frames with setero data on pi3. Slow but acceptable.
         """
-        samples = islice(MemScope(buffer, self.capture_cfg), n_sample)
+        samples = islice(MemScope(self._buffer, self.capture_cfg), self.probe_cfg.sample_size)
         data = [abs(val - self.capture_cfg.reference) for packet in samples for val in packet]
-        return statistics.median(data)
+        med = statistics.median(data)
+        logging.debug('polled med %.0f <> threshold (%.0f, %.0f)',
+                      med, self._threscomp.low, self._threscomp.high)
+        return self._threscomp.comp(med)
+
+    @probe.setter
+    def probe(self, val):
+        if val == 0:
+            self._threscomp = HystComp(0, 0)
+        else:
+            val = -abs(val)
+            self._threscomp = HystComp(
+                self.__reverse_db(val),
+                self.__reverse_db(val - 3))
 
     def __load_config(self):
         default = ProbeConfig()
@@ -283,10 +303,10 @@ class LoopStateMachine:
 
         while self.state is not PlayerState.KILLED:
             cmd = await self.rxq.get()
-            logging.info('Dispatch command %s', cmd)
             await self._gather()
 
             todo = manifests[cmd]
+            logging.info('Received command %s. Dispatching %.1f seconds', cmd, todo.delay)
             self.state = todo.state
             self.loop.call_later(todo.delay, asyncio.create_task, todo.coro())
             self.rxq.task_done()
@@ -296,43 +316,37 @@ class LoopStateMachine:
         self.loop.create_task(self._idle())
 
     async def _idle(self):
+        counter = 0
         while self.state == PlayerState.IDLE:
-            self.buffer = self.capture.read()
-            med = self.__smp_median(self.buffer)
-            if med > self.thresholds.start:
-                self.counter += 1
+            self._buffer = self.capture.read()
+            if self.probe.high:
+                counter += 1
             else:
-                self.counter = 0
+                counter = 0
 
-            logging.debug('polled %.0f <> threshold %.0f, counter=%d', med, self.thresholds.start, self.counter)
-
-            if self.counter >= self.probe_cfg.start_count:
-                self.counter = 0
+            if counter >= self.probe_cfg.start_count:
                 self.state = PlayerState.PLAY
                 self.loop.create_task(self._stream())
                 await asyncio.sleep(self.probe_cfg.stream_interval)
                 self.loop.create_task(self._monitor())
-            elif self.counter > 0:
+            elif counter > 0:
                 await asyncio.sleep(self.probe_cfg.follow_interval)
             else:
                 await asyncio.sleep(self.probe_cfg.idle_interval)
 
     async def _monitor(self):
+        counter = 0
         while self.state == PlayerState.PLAY:
-            med = self.__smp_median(self.buffer)
-            if med < self.thresholds.stop:
-                self.counter += 1
+            if self.probe.low:
+                counter += 1
             else:
-                self.counter = 0
+                counter = 0
 
-            logging.debug('polled %.0f <> threshold %.0f, counter=%d', med, self.thresholds.stop, self.counter)
-
-            if self.counter >= self.probe_cfg.stop_count:
+            if counter >= self.probe_cfg.stop_count:
                 self.state = PlayerState.IDLE
-                self.counter = 0
                 await asyncio.sleep(self.probe_cfg.idle_interval)
                 self.loop.create_task(self._idle())
-            elif self.counter > 0:
+            elif counter > 0:
                 await asyncio.sleep(self.probe_cfg.follow_interval)
             else:
                 await asyncio.sleep(self.probe_cfg.stream_interval)
@@ -341,11 +355,11 @@ class LoopStateMachine:
         logging.info('start redirecting [%s] => [%s]', self.capture.name, self.playback_cfg.pcm_name)
 
         with PlaybackDevice(self.playback_cfg) as playback:
-            playback.write(self.buffer)
+            playback.write(self._buffer)
 
             while self.state == PlayerState.PLAY:
-                self.buffer = self.capture.read()
-                playback.write(self.buffer)
+                self._buffer = self.capture.read()
+                playback.write(self._buffer)
                 await asyncio.sleep(0.001)
 
         logging.info('close playback')
@@ -372,4 +386,3 @@ class LoopStateMachine:
         await self._gather()
         self.close()
         self.loop.stop()
-
