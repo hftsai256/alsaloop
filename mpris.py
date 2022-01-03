@@ -23,7 +23,6 @@
 # Some bits taken from quodlibet mpris plugin by:
 #           <christoph.reiter@gmx.at>
 
-import sys
 import logging
 import asyncio
 
@@ -58,25 +57,6 @@ class DBusThread(Thread):
 
     def stop(self):
         self.loop.quit()
-
-
-class ThreadSafeAIOQueue:
-    def __init__(self, queue: asyncio.Queue):
-        self.queue = queue
-
-    def put(self, payload):
-        logging.debug('sending command over queue: %s', payload)
-        loop = asyncio.get_running_loop()
-        loop.call_soon_threadsafe(self.queue.put_nowait, payload)
-        #future = asyncio.run_coroutine_threadsafe(
-        #            self.queue.put(payload), loop)
-        #return future.result(0.1)
-
-    def get(self):
-        loop = asyncio.get_running_loop()
-        future = asyncio.run_coroutine_threadsafe(
-                    self.queue.get(), loop)
-        return future.result(0.1)
 
 
 class MPRISConnector(dbus.service.Object):
@@ -120,9 +100,6 @@ class MPRISConnector(dbus.service.Object):
         dbus_thread.start()
         logging.info('DBus thread started at %s as %s',
                      self.dbus.unique_name, broadcast_name)
-
-    def set_main_loop(self, loop):
-        self.aioloop = loop
 
     def close(self):
         self.dbus.bus.close()
@@ -192,7 +169,7 @@ class MPRISConnector(dbus.service.Object):
         if self.playback_status in [PlayerState.PLAY, PlayerState.IDLE]:
             future = asyncio.run_coroutine_threadsafe(self.txq.put(PlayerCommand.STOP), self.aioloop)
         else:
-            future = asyncio.run_coroutine_threadsafe(self.txq.put(PlayerCommand.STOP), self.aioloop)
+            future = asyncio.run_coroutine_threadsafe(self.txq.put(PlayerCommand.IDLE), self.aioloop)
         return future.result(0.1)
 
     @dbus.service.method(DBusConfig.player_iface, in_signature='', out_signature='')
@@ -203,18 +180,5 @@ class MPRISConnector(dbus.service.Object):
 
     @dbus.service.method(DBusConfig.player_iface, in_signature='', out_signature='')
     def Play(self):
-        future = asyncio.run_coroutine_threadsafe(self.txq.put(PlayerCommand.PLAY), self.aioloop)
+        future = asyncio.run_coroutine_threadsafe(self.txq.put(PlayerCommand.IDLE), self.aioloop)
         return future.result(0.1)
-
-
-def config_logger():
-    if len(sys.argv) > 1:
-        if "-v" in sys.argv:
-            logging.basicConfig(format='%(levelname)s: %(name)s - %(message)s',
-                                level=logging.DEBUG)
-            logging.debug("enabled verbose logging")
-    else:
-        logging.basicConfig(format='%(levelname)s: %(name)s - %(message)s',
-                            level=logging.INFO)
-
-

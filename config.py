@@ -10,11 +10,9 @@ PACKAGE_NAME = PACKAGE_ROOT.parts[-1]
 
 class PlayerCommand(Enum):
     STOP   = auto()
+    IDLE   = auto()
     PLAY   = auto()
-    CONFIG = auto()
-    LOAD   = auto()
-    SAVE   = auto()
-
+    KILL   = auto()
 
 class PlayerState(Enum):
     IDLE      = auto()

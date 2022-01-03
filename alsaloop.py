@@ -1,3 +1,4 @@
+from asyncio.tasks import Task
 import io
 import re
 import json
@@ -192,31 +193,26 @@ class MemScope:
         return (f'{endian}{body}')
 
 
-class HystComp:
-    def __init__(self, low: float, high: float):
-        logging.debug('hysteresis comparator registered as (%.1f, %.1f)', low, high)
-        self.low = low
-        self.high = high
-
-    def __repr__(self):
-        return f'<HystComp({self.low:.2e}, {self.high:.2e}>'
+class SequenceComp:
+    def __init__(self, *reference):
+        logging.debug(f'sequencial comparator registered as {reference}')
+        self.reference = reference
 
     def comp(self, val):
-        CompResult = namedtuple('HystCompResult', ['low', 'high'])
-        return CompResult(val <= self.low, val >= self.high)
+        return [val > ref for ref in self.reference]
 
 
 class LoopStateMachine:
     def __init__(self,
                  capture_cfg: AlsaDeviceConfig,
                  playback_cfg: AlsaDeviceConfig):
-        self.rxq = asyncio.Queue()
+        self.task_queue = asyncio.Queue()
         self.capture_cfg = capture_cfg
         self.playback_cfg = playback_cfg
         self.probe_cfg = self.__load_config()
         self.capture = None
         self.dbus = None
-        self.probe = self.probe_cfg.sensitivity
+        self.active = self.probe_cfg.sensitivity
 
         self._local_state = PlayerState.UNKNOWN
         self._buffer = b''
@@ -225,24 +221,22 @@ class LoopStateMachine:
         return self.capture_cfg.maxamp * 10**(db/20)
 
     @property
-    def probe(self):
+    def active(self):
         """Calculated median from data across all channels.
            Takes around 1 ms at 40 frames with setero data on pi3. Slow but acceptable.
         """
         samples = islice(MemScope(self._buffer, self.capture_cfg), self.probe_cfg.sample_size)
         data = [abs(val - self.capture_cfg.reference) for packet in samples for val in packet]
         med = statistics.median(data)
-        logging.debug('polled med %.0f <> threshold (%.0f, %.0f)',
-                      med, self._threscomp.low, self._threscomp.high)
         return self._threscomp.comp(med)
 
-    @probe.setter
-    def probe(self, val):
+    @active.setter
+    def active(self, val):
         if val == 0:
-            self._threscomp = HystComp(0, 0)
+            self._threscomp = SequenceComp(0, 0)
         else:
             val = -abs(val)
-            self._threscomp = HystComp(
+            self._threscomp = SequenceComp(
                 self.__reverse_db(val),
                 self.__reverse_db(val - 3))
 
@@ -266,7 +260,7 @@ class LoopStateMachine:
 
     def open(self):
         self.capture = CaptureDevice(self.capture_cfg)
-        self.dbus = MPRISConnector(self.rxq)
+        self.dbus = MPRISConnector(self.task_queue)
         self.capture.open()
         self.dbus.open()
 
@@ -287,48 +281,53 @@ class LoopStateMachine:
             logging.warning('Cannot connect to DBus.')
 
     async def run(self):
-        TaskInfo = namedtuple('TaskInfo', ['state', 'delay', 'coro'])
-        manifests = {
-            PlayerCommand.STOP:  TaskInfo(PlayerState.HYBERNATE,
-                                          self.probe_cfg.hybernate_interval,
-                                          self._wake),
-            PlayerCommand.PLAY:  TaskInfo(PlayerState.IDLE,
-                                          self.probe_cfg.idle_interval,
-                                          self._idle),
+        FutureTask = namedtuple('TaskInfo', ['state', 'delay', 'coro'])
+        cmdtasks = {
+            PlayerCommand.STOP: FutureTask(PlayerState.HYBERNATE,
+                                           self.probe_cfg.hybernate_interval,
+                                           [self._wake]),
+            PlayerCommand.IDLE: FutureTask(PlayerState.IDLE,
+                                           self.probe_cfg.idle_interval,
+                                           [self._idle]),
+            PlayerCommand.PLAY: FutureTask(PlayerState.PLAY,
+                                           0,
+                                           [self._monitor, self._stream]),
+            PlayerCommand.KILL: FutureTask(PlayerState.KILLED,
+                                           0,
+                                           [self._shutdown])
         }
 
         self.loop = asyncio.get_running_loop()
         self.dbus.aioloop = self.loop
-        await self.rxq.put(PlayerCommand.PLAY)
+        await self.task_queue.put(PlayerCommand.IDLE)
 
         while self.state is not PlayerState.KILLED:
-            cmd = await self.rxq.get()
+            cmd = await self.task_queue.get()
             await self._gather()
 
-            todo = manifests[cmd]
-            logging.info('Received command %s. Dispatching %.1f seconds', cmd, todo.delay)
+            todo = cmdtasks[cmd]
+            logging.info('Dispatch received command %s in %.1f seconds', cmd, todo.delay)
             self.state = todo.state
-            self.loop.call_later(todo.delay, asyncio.create_task, todo.coro())
-            self.rxq.task_done()
+            for coroutine in todo.coro:
+                self.loop.call_later(todo.delay, asyncio.create_task, coroutine())
+            self.task_queue.task_done()
 
     async def _wake(self):
-        self.state = PlayerState.IDLE
-        self.loop.create_task(self._idle())
+        await self.task_queue.put(PlayerCommand.IDLE)
 
     async def _idle(self):
         counter = 0
         while self.state == PlayerState.IDLE:
             self._buffer = self.capture.read()
-            if self.probe.high:
+            if all(self.active):
                 counter += 1
             else:
                 counter = 0
+            logging.debug(f'{self.active!r}, {counter=}')
 
             if counter >= self.probe_cfg.start_count:
-                self.state = PlayerState.PLAY
-                self.loop.create_task(self._stream())
-                await asyncio.sleep(self.probe_cfg.stream_interval)
-                self.loop.create_task(self._monitor())
+                await self.task_queue.put(PlayerCommand.PLAY)
+                return
             elif counter > 0:
                 await asyncio.sleep(self.probe_cfg.follow_interval)
             else:
@@ -337,15 +336,15 @@ class LoopStateMachine:
     async def _monitor(self):
         counter = 0
         while self.state == PlayerState.PLAY:
-            if self.probe.low:
+            if not any(self.active):
                 counter += 1
             else:
                 counter = 0
+            logging.debug(f'{self.active!r}, {counter=}')
 
             if counter >= self.probe_cfg.stop_count:
-                self.state = PlayerState.IDLE
-                await asyncio.sleep(self.probe_cfg.idle_interval)
-                self.loop.create_task(self._idle())
+                await self.task_queue.put(PlayerCommand.IDLE)
+                return
             elif counter > 0:
                 await asyncio.sleep(self.probe_cfg.follow_interval)
             else:
@@ -353,20 +352,18 @@ class LoopStateMachine:
 
     async def _stream(self):
         logging.info('start redirecting [%s] => [%s]', self.capture.name, self.playback_cfg.pcm_name)
-
         try:
             with PlaybackDevice(self.playback_cfg) as playback:
                 playback.write(self._buffer)
-
                 while self.state == PlayerState.PLAY:
                     self._buffer = self.capture.read()
                     playback.write(self._buffer)
                     await asyncio.sleep(0.001)
+
         except alsaaudio.ALSAAudioError as e:
             logging.info('Error opening playback device: %s', e)
-            await self.rxq.put(PlayerCommand.STOP)
-
-        logging.info('close playback')
+            await self.task_queue.put(PlayerCommand.STOP)
+            return
 
     async def _gather(self):
         tasks = [t for t in asyncio.all_tasks() if t is not
