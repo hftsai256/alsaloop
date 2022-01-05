@@ -1,4 +1,4 @@
-from asyncio.tasks import Task
+import os
 import io
 import re
 import json
@@ -223,7 +223,9 @@ class LoopStateMachine:
     @property
     def active(self):
         """Calculated median from data across all channels.
-           Takes around 1 ms at 40 frames with setero data on pi3. Slow but acceptable.
+           40 frames takes around 1 ms at 40 frames with setero data on pi3, which is slow enough
+           to generate noticable jitter when playing high sampled stream. Therefore it is necessary
+           to lower the sample size and/or decrease process priority to mitigate this effect.
         """
         samples = islice(MemScope(self._buffer, self.capture_cfg), self.probe_cfg.sample_size)
         data = [abs(val - self.capture_cfg.reference) for packet in samples for val in packet]
@@ -270,6 +272,8 @@ class LoopStateMachine:
 
     @property
     def state(self):
+        """Wrapping over self.state property so that it can be synchronized with
+           PlaybackStatus from MPRIS connector"""
         return self._local_state
 
     @state.setter
@@ -281,6 +285,9 @@ class LoopStateMachine:
             logging.warning('Cannot connect to DBus.')
 
     async def run(self):
+        """Main command dispatcher a.k.a. main coroutine.
+           Responsible to take external (MPRIS/DBus) or internal command
+           to switch between operation states"""
         FutureTask = namedtuple('TaskInfo', ['state', 'delay', 'coro'])
         cmdtasks = {
             PlayerCommand.STOP: FutureTask(PlayerState.HYBERNATE,
@@ -316,6 +323,10 @@ class LoopStateMachine:
         await self.task_queue.put(PlayerCommand.IDLE)
 
     async def _idle(self):
+        """Idle state, sampling signal from the capturing device periodically.
+           Set to lowest priority to not interfere with other task that may create
+           noticable jitter."""
+        os.nice(19)
         counter = 0
         while self.state == PlayerState.IDLE:
             self._buffer = self.capture.read()
@@ -334,6 +345,8 @@ class LoopStateMachine:
                 await asyncio.sleep(self.probe_cfg.idle_interval)
 
     async def _monitor(self):
+        """Monitoring streaming signal intensity periodically. Shut off playback device
+           when the capturing signal is below certain threshold over a period of time"""
         counter = 0
         while self.state == PlayerState.PLAY:
             if not any(self.active):
@@ -351,6 +364,9 @@ class LoopStateMachine:
                 await asyncio.sleep(self.probe_cfg.stream_interval)
 
     async def _stream(self):
+        """Redirect whatever is captured from the designated interface. Bring the process
+           priority to normal."""
+        os.nice(0)
         logging.info('start redirecting [%s] => [%s]', self.capture.name, self.playback_cfg.pcm_name)
         try:
             with PlaybackDevice(self.playback_cfg) as playback:
@@ -366,6 +382,7 @@ class LoopStateMachine:
             return
 
     async def _gather(self):
+        """Cancel all other active tasks to close ALSA devices gracefully"""
         tasks = [t for t in asyncio.all_tasks() if t is not
                  asyncio.current_task()]
 
@@ -375,6 +392,7 @@ class LoopStateMachine:
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _restart(self, sig):
+        """Restart handler"""
         self.state = PlayerState.UNKNOWN
         logging.info('Received restart signal %s.', sig.name)
         await self._gather()
@@ -382,6 +400,7 @@ class LoopStateMachine:
         self.loop.create_task(self.run())
 
     async def _shutdown(self, sig):
+        """Kill handler"""
         self.state = PlayerState.KILLED
         logging.info('Received exit signal %s.', sig.name)
         await self._gather()

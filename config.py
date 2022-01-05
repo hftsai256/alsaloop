@@ -52,13 +52,13 @@ class UpdatableDataclass:
 @dataclass
 class ProbeConfig(UpdatableDataclass):
     sensitivity: float = -60
-    idle_interval: float = 0.25
-    follow_interval: float = 0.5
+    idle_interval: float = 0.5
+    follow_interval: float = 1.0
     stream_interval: float = 2.0
     hybernate_interval: float = 15
     start_count: int = 1
     stop_count: int = 10
-    sample_size: int = 40
+    sample_size: int = 8 
 
 
 @dataclass
