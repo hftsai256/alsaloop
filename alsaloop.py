@@ -2,7 +2,6 @@ import os
 import io
 import re
 import json
-import time
 import struct
 import logging
 import asyncio
@@ -15,6 +14,7 @@ from collections import namedtuple
 from dataclasses import dataclass
 
 from mpris import MPRISConnector
+from fileio import *
 from config import *
 
 @dataclass
@@ -35,7 +35,7 @@ class AlsaDeviceConfig:
     fmt_matcher = re.compile(r'.*(S|U)(\d+)_?(LE|BE)?$').match
 
     def __init__(self,
-                 pcm_name: str = 'default',
+                 pcm_name: str = HFBCARD_PCM,
                  pcm_data_format: str ='PCM_FORMAT_S16_LE',
                  channels: int = 2,
                  rate: int = 48000,
@@ -96,14 +96,11 @@ class AlsaDevice:
 
     def _pick(self, name):
         pcms = alsaaudio.pcms(self.dev_type)
-        if name == 'default' or name in pcms:
+        if name in pcms:
             return name
-
-        try:
-            ret = [n for n in pcms if 'sysdefault:CARD' in n][0]
-        except IndexError:
-            ret = 'default'
-        return  ret
+        elif f'sysdefault:CARD={name}' in pcms:
+            return f'sysdefault:CARD={name}'
+        return [n for n in pcms if 'sysdefault:CARD' in n][0]
 
 
 class CaptureDevice(AlsaDevice):
@@ -120,7 +117,6 @@ class CaptureDevice(AlsaDevice):
                 warnings.warn(f'Broken Pipe: {length}', RuntimeWarning)
             else:
                 warnings.warn(f'Unknown Error: Code={length}', RuntimeWarning)
-            time.sleep(0.010)
 
 
 class PlaybackDevice(AlsaDevice):
@@ -219,6 +215,11 @@ class LoopStateMachine:
 
     def __reverse_db(self, db):
         return self.capture_cfg.maxamp * 10**(db/20)
+
+    @property
+    def playback_free(self):
+        """Check if playback device is busy"""
+        return cat(f'/proc/asound/{HFBCARD_NAME}/pcm0p/sub0/status').strip() == 'closed'
 
     @property
     def active(self):
@@ -324,11 +325,16 @@ class LoopStateMachine:
 
     async def _idle(self):
         """Idle state, sampling signal from the capturing device periodically.
-           Set to lowest priority to not interfere with other task that may create
-           noticable jitter."""
+           If playback device is busy (another player is running) then switch to
+           hybernate state. Also, setting to the lowest priority to avoid interfering
+           with other task that may create noticable jitter."""
         os.nice(19)
         counter = 0
         while self.state == PlayerState.IDLE:
+            if not self.playback_free:
+                await asyncio.sleep(self.probe_cfg.follow_interval)
+                continue
+
             self._buffer = self.capture.read()
             if all(self.active):
                 counter += 1
@@ -379,7 +385,6 @@ class LoopStateMachine:
         except alsaaudio.ALSAAudioError as e:
             logging.info('Error opening playback device: %s', e)
             await self.task_queue.put(PlayerCommand.STOP)
-            return
 
     async def _gather(self):
         """Cancel all other active tasks to close ALSA devices gracefully"""

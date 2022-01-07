@@ -5,8 +5,14 @@ from types import SimpleNamespace
 from dataclasses import dataclass, field
 import dbus
 
+from fileio import *
+
 PACKAGE_ROOT = Path(__file__).parent
 PACKAGE_NAME = PACKAGE_ROOT.parts[-1]
+HFBCARD_INDEX = grep(cat('/etc/hifiberry.state'), r'CURRENT_HW_SHORT=(\d+)')[0]
+HFBCARD_NAME = cat(f'/proc/asound/card{HFBCARD_INDEX}/id').strip()
+HFBCARD_PCM = f'sysdefault:CARD={HFBCARD_NAME}'
+
 
 class PlayerCommand(Enum):
     STOP   = auto()

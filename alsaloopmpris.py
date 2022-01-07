@@ -17,7 +17,7 @@ def parse_args():
                     Will fall back to the next available device.
                     default=None''')
     parser.add_argument(
-            '-p', '--playback', default='default',
+            '-p', '--playback', default=HFBCARD_PCM,
             help=argparse.SUPPRESS) # Hide this option from normal users
     parser.add_argument(
             '-f', '--format', default='PCM_FORMAT_S16_LE',
